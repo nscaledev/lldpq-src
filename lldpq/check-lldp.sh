@@ -210,11 +210,11 @@ for i in {1..30}; do
     fi
 done
 recent_files=$(find . -type f -name "*.ini" -mtime -1)
-for file in $recent_files; do
-    keep_files+=("$file")
-done
-find . -type f -name "*.ini" | while read file; do
-    if [[ ! " ${keep_files[@]} " =~ " ${file} " ]]; then
+while IFS= read -r file; do
+    [ -n "$file" ] && keep_files+=("$file")
+done <<< "$recent_files"
+find . -type f -name "*.ini" | while IFS= read -r file; do
+    if ! printf '%s\n' "${keep_files[@]}" | grep -Fqx -- "$file"; then
         sudo rm "$file"
     fi
 done

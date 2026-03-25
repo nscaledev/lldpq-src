@@ -2,30 +2,59 @@
 """
 Build topology.dot from NetBox cable data with strict switch filtering.
 
-This builder only maps links when:
-1) Both devices are in the requested `netbox_cluster`.
-2) Device names match allowed patterns (prefixes + contains tokens).
-3) Port names match per-device rules:
-   - `swi*`: prefix match (default `swp`)
-   - `rtr*` / `nfw*`: regex match (default allow-all)
-4) The source interface has a cable assigned.
+This builder maps links when:
+1) Local device is in the requested `netbox_cluster`.
+2) Local device name matches the requested prefix (default `swi`).
+3) Local port matches prefix/extra rules (default `swp*` plus `eth0`).
+4) The local interface has a cable assigned.
+5) Peer device/interface are included without peer-side name/port filtering,
+   with optional peer-name regex filtering.
 """
 
 import argparse
 import fnmatch
+import http.client
 import json
 import os
 import re
-import subprocess
+import socket
+import ssl
 import sys
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Pattern, Set, Tuple
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 
 
 Edge = Tuple[str, str, str, str]
+DEFAULT_PCIE_SLOT_MAP_JSON = (
+    '{"*-p-phy-osh*":{"1":"5","2":"8"},'
+    '"*-p-phy-cpo*":{"1":"5","2":"8"},'
+    '"*-proxmox-mgt*":{"1":"5","2":"8"}}'
+)
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass
+class NetboxTopologyConfig:
+    netbox_url: str
+    netbox_token: str
+    netbox_cluster: str
+    device_prefix: str
+    device_name: Optional[str]
+    port_prefix: str
+    primary_extra_port_regexes: List[Pattern[str]]
+    include_peer_regex: Pattern[str]
+    interface_name_overrides: Dict[str, str]
+    pcie_slot_map: Dict[str, Dict[str, str]]
+    exclude_interface_regexes: List[Pattern[str]]
+    output: str
+    timeout: int
+    proxy_url: Optional[str]
+    verify_tls: bool
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a GraphViz DOT topology from NetBox cables, restricted "
@@ -35,73 +64,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--netbox-url", default=os.getenv("NETBOX_URL"), help="NetBox base URL")
     parser.add_argument("--netbox-token", default=os.getenv("NETBOX_TOKEN"), help="NetBox API token")
     parser.add_argument(
-        "--pattern-config",
-        default=os.getenv("NETBOX_PATTERN_CONFIG", "lldpq/netbox_topology_patterns.json"),
-        help="Pattern config JSON path (default: lldpq/netbox_topology_patterns.json)",
-    )
-    parser.add_argument(
         "--netbox-cluster",
         default=os.getenv("NETBOX_CLUSTER"),
-        help="Cluster filter value (required)",
+        help="Cluster name filter (required)",
     )
     parser.add_argument(
         "--device-prefix",
         default="swi",
-        help="Primary device name prefix filter (default: swi)",
-    )
-    parser.add_argument(
-        "--extra-device-prefixes",
-        default="rtr,nfw",
-        help="Additional device prefixes (comma-separated, default: rtr,nfw)",
-    )
-    parser.add_argument(
-        "--extra-device-contains",
-        default="",
-        help="Additional device substring matches (comma-separated, default: none)",
-    )
-    parser.add_argument(
-        "--shared-devices",
-        default=os.getenv("NETBOX_SHARED_DEVICES", ""),
-        help=(
-            "Static comma-separated device names to allow outside the cluster "
-            "(example: edge-router-a,edge-router-b)"
-        ),
+        help="Local device name prefix filter (default: swi)",
     )
     parser.add_argument(
         "--device-name",
         default=None,
-        help="Optional exact device name filter within the cluster",
+        help="Optional exact local device name filter within the cluster",
     )
     parser.add_argument(
         "--port-prefix",
         default="swp",
-        help="Primary interface prefix for primary device prefix (default: swp)",
+        help="Local interface prefix for local device prefix (default: swp)",
     )
     parser.add_argument(
         "--primary-extra-port-regexes",
         default="^eth0$",
         help=(
-            "Comma-separated regexes to allow extra primary interfaces "
+            "Comma-separated regexes to allow extra local interfaces "
             "(default: ^eth0$)"
         ),
     )
     parser.add_argument(
-        "--rtr-port-regex",
+        "--include-peer-regex",
         default=".*",
-        help="Regex for rtr* interface names (default: .*)",
-    )
-    parser.add_argument(
-        "--nfw-port-regex",
-        default="^ethernet-",
-        help="Regex for nfw* interface names (default: ^ethernet-)",
-    )
-    parser.add_argument(
-        "--extra-port-regexes",
-        default="",
-        help=(
-            "Extra prefix regexes (comma-separated prefix:regex, "
-            "example: rtr:^et,nfw:^ethernet-,edge:^xe-)"
-        ),
+        help="Regex for peer device name include filter (default: .*)",
     )
     parser.add_argument(
         "--interface-name-overrides",
@@ -114,16 +107,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pcie-slot-map",
-        default="{}",
+        default=DEFAULT_PCIE_SLOT_MAP_JSON,
         help=(
             "JSON dict of device-pattern -> slot map for PCIe names. "
-            "Example: {\"host-*\": {\"1\": \"5\", \"2\": \"8\"}}"
+            'Example: {"host-*": {"1": "5", "2": "8"}} '
+            '(default includes {"*-p-phy-osh*":{"1":"5","2":"8"},"*-p-phy-cpo*":{"1":"5","2":"8"},"*-proxmox-mgt*":{"1":"5","2":"8"}})'
         ),
     )
     parser.add_argument(
         "--exclude-interface-regexes",
         default="",
-        help="Comma-separated regexes for interfaces to ignore (default: none)",
+        help="Comma-separated regexes for interfaces to ignore on either cable end (default: none)",
     )
     parser.add_argument(
         "--output",
@@ -139,14 +133,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--netbox-proxy",
         default=os.getenv("NETBOX_PROXY"),
-        help="Optional proxy URL (for example socks5h://127.0.0.1:8888)",
+        help="Optional proxy URL (for example socks5://127.0.0.1:8888)",
     )
     parser.add_argument(
         "--insecure",
         action="store_true",
         help="Disable TLS certificate verification",
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def parse_config(argv: Optional[List[str]] = None) -> NetboxTopologyConfig:
+    parser = argparse.ArgumentParser(add_help=False)
+    args = parse_args(argv)
 
     missing = []
     if not args.netbox_url:
@@ -155,73 +154,32 @@ def parse_args() -> argparse.Namespace:
         missing.append("netbox-token/NETBOX_TOKEN")
     if not args.netbox_cluster:
         missing.append("netbox-cluster/NETBOX_CLUSTER")
-
     if missing:
-        parser.error("Missing required settings: " + ", ".join(missing))
+        raise ValueError("Missing required settings: " + ", ".join(missing))
 
-    return args
+    primary_extra_port_regexes = parse_regex_list(args.primary_extra_port_regexes)
+    exclude_regexes = parse_regex_list(args.exclude_interface_regexes)
+    interface_overrides = parse_interface_overrides(args.interface_name_overrides)
+    pcie_slot_map = parse_pcie_slot_map(args.pcie_slot_map)
+    include_peer_regex = re.compile(args.include_peer_regex, re.IGNORECASE)
 
-
-def parse_prefixes(primary_prefix: str, extra_prefixes: str) -> List[str]:
-    prefixes = [primary_prefix.strip().lower()]
-    for raw in (extra_prefixes or "").split(","):
-        value = raw.strip().lower()
-        if value and value not in prefixes:
-            prefixes.append(value)
-    return prefixes
-
-
-def parse_extra_regexes(
-    extra_prefixes: List[str],
-    raw_regexes: str,
-    rtr_regex: str,
-    nfw_regex: str,
-) -> Dict[str, Pattern[str]]:
-    regex_by_prefix: Dict[str, str] = {}
-    if "rtr" in extra_prefixes:
-        regex_by_prefix["rtr"] = rtr_regex
-    if "nfw" in extra_prefixes:
-        regex_by_prefix["nfw"] = nfw_regex
-
-    for part in (raw_regexes or "").split(","):
-        chunk = part.strip()
-        if not chunk or ":" not in chunk:
-            continue
-        prefix, regex = chunk.split(":", 1)
-        prefix = prefix.strip().lower()
-        regex = regex.strip()
-        if prefix and regex:
-            regex_by_prefix[prefix] = regex
-
-    compiled: Dict[str, Pattern[str]] = {}
-    for prefix in extra_prefixes:
-        pattern_text = regex_by_prefix.get(prefix, ".*")
-        compiled[prefix] = re.compile(pattern_text)
-    return compiled
-
-
-def parse_name_set(raw_value: str) -> Set[str]:
-    return {item.strip().lower() for item in (raw_value or "").split(",") if item.strip()}
-
-
-def parse_name_list(raw_value: str) -> List[str]:
-    return [item.strip().lower() for item in (raw_value or "").split(",") if item.strip()]
-
-
-def classify_device_kind(
-    device_name: str,
-    primary_prefix: str,
-    extra_prefixes: List[str],
-    extra_contains: List[str],
-) -> str:
-    lower = device_name.lower()
-    if lower.startswith(primary_prefix.lower()):
-        return "primary"
-    if any(lower.startswith(prefix.lower()) for prefix in extra_prefixes):
-        return "extra"
-    if any(token in lower for token in extra_contains):
-        return "extra"
-    return "other"
+    return NetboxTopologyConfig(
+        netbox_url=args.netbox_url,
+        netbox_token=args.netbox_token,
+        netbox_cluster=args.netbox_cluster,
+        device_prefix=args.device_prefix,
+        device_name=args.device_name.strip().lower() if args.device_name else None,
+        port_prefix=args.port_prefix,
+        primary_extra_port_regexes=primary_extra_port_regexes,
+        include_peer_regex=include_peer_regex,
+        interface_name_overrides=interface_overrides,
+        pcie_slot_map=pcie_slot_map,
+        exclude_interface_regexes=exclude_regexes,
+        output=args.output,
+        timeout=args.timeout,
+        proxy_url=args.netbox_proxy,
+        verify_tls=not args.insecure,
+    )
 
 
 def allowed_port_for_device(
@@ -230,9 +188,6 @@ def allowed_port_for_device(
     primary_prefix: str,
     primary_port_prefix: str,
     primary_extra_port_regexes: List[Pattern[str]],
-    extra_prefixes: List[str],
-    extra_contains: List[str],
-    extra_port_regexes: Dict[str, Pattern[str]],
 ) -> bool:
     dev = device_name.lower()
     if dev.startswith(primary_prefix.lower()):
@@ -240,80 +195,11 @@ def allowed_port_for_device(
         return iface.lower().startswith(primary_port_prefix.lower()) or any(
             regex.search(iface) for regex in primary_extra_port_regexes
         )
-
-    for prefix in extra_prefixes:
-        if dev.startswith(prefix.lower()):
-            regex = extra_port_regexes.get(prefix.lower())
-            if regex is None:
-                return True
-            return bool(regex.search(interface_name))
-    if any(token in dev for token in extra_contains):
-        return True
     return False
-
-
-def is_supported_link(local_kind: str, peer_kind: str) -> bool:
-    return (local_kind == "primary" and peer_kind in {"primary", "extra"}) or (
-        peer_kind == "primary" and local_kind in {"primary", "extra"}
-    )
-
-
-def _cli_has_flag(flag: str) -> bool:
-    return any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv[1:])
-
-
-def apply_pattern_config(args: argparse.Namespace) -> argparse.Namespace:
-    config_path = args.pattern_config
-    if not config_path or not os.path.exists(config_path):
-        return args
-
-    with open(config_path, "r", encoding="utf-8") as handle:
-        cfg = json.load(handle) or {}
-    if not isinstance(cfg, dict):
-        return args
-
-    mapping = [
-        ("device_prefix", "--device-prefix"),
-        ("extra_device_prefixes", "--extra-device-prefixes"),
-        ("extra_device_contains", "--extra-device-contains"),
-        ("port_prefix", "--port-prefix"),
-        ("primary_extra_port_regexes", "--primary-extra-port-regexes"),
-        ("rtr_port_regex", "--rtr-port-regex"),
-        ("nfw_port_regex", "--nfw-port-regex"),
-        ("extra_port_regexes", "--extra-port-regexes"),
-        ("interface_name_overrides", "--interface-name-overrides"),
-        ("pcie_slot_map", "--pcie-slot-map"),
-        ("exclude_interface_regexes", "--exclude-interface-regexes"),
-        ("shared_devices", "--shared-devices"),
-    ]
-
-    for key, flag in mapping:
-        if _cli_has_flag(flag):
-            continue
-        if key not in cfg:
-            continue
-        value = cfg[key]
-        if isinstance(value, list):
-            value = ",".join(str(item).strip() for item in value if str(item).strip())
-        elif isinstance(value, dict):
-            value = json.dumps(value)
-        elif value is None:
-            value = ""
-        else:
-            value = str(value)
-        setattr(args, key, value)
-
-    return args
 
 
 def normalize_value(value: object) -> Optional[str]:
     if value is None:
-        return None
-    if isinstance(value, dict):
-        for key in ("name", "slug", "label", "value", "display"):
-            candidate = value.get(key)
-            if candidate is not None:
-                return str(candidate).strip().lower()
         return None
     text = str(value).strip()
     return text.lower() if text else None
@@ -382,15 +268,11 @@ def normalize_interface_for_output(
     iface_key = iface.lower()
     slot_map = pcie_slot_map or {}
 
-    # Static overrides first (device-specific, then global interface mapping).
     if f"{dev_key}:{iface_key}" in overrides:
         return overrides[f"{dev_key}:{iface_key}"]
     if iface_key in overrides:
         return overrides[iface_key]
 
-    # Generic PCIe convenience rewrite:
-    # PCIe-<N>-200G-1 -> ens<N>f0np0
-    # PCIe-<N>-200G-2 -> ens<N>f1np1
     match = re.match(r"^PCIe-(\d+)-200G-(\d+)$", iface, re.IGNORECASE)
     if match:
         slot, lane = match.groups()
@@ -403,42 +285,184 @@ def normalize_interface_for_output(
     return iface
 
 
-def device_netbox_cluster_name(device: Dict) -> Optional[str]:
-    # Strict cluster source only:
-    # 1) NetBox device.cluster.name (preferred)
-    # 2) netbox_cluster field (if present)
-    # No site/tenant/tag/other fallback matching.
+def device_cluster_name(device: Dict) -> Optional[str]:
     cluster_obj = device.get("cluster")
-    norm = normalize_value(cluster_obj)
-    if norm:
-        return norm
-
-    for container in (device, device.get("custom_fields") or {}, device.get("local_context_data") or {}):
-        if isinstance(container, dict):
-            raw = container.get("netbox_cluster")
-            norm = normalize_value(raw)
-            if norm:
-                return norm
-    return None
+    if not isinstance(cluster_obj, dict):
+        return None
+    return normalize_value(cluster_obj.get("name"))
 
 
 def in_cluster(device: Dict, cluster_value: str) -> bool:
     target = normalize_value(cluster_value)
     if not target:
         return False
-    return device_netbox_cluster_name(device) == target
+    return device_cluster_name(device) == target
 
 
-def paginated_get(
+def _socks5_connect(proxy_host: str, proxy_port: int, target_host: str, target_port: int, timeout: int) -> socket.socket:
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+
+    # no-auth SOCKS5
+    sock.sendall(b"\x05\x01\x00")
+    method_reply = sock.recv(2)
+    if len(method_reply) != 2 or method_reply[0] != 0x05 or method_reply[1] == 0xFF:
+        sock.close()
+        raise OSError("SOCKS5 proxy does not accept no-auth")
+
+    host_bytes = target_host.encode("idna")
+    if len(host_bytes) > 255:
+        sock.close()
+        raise OSError("Target hostname is too long for SOCKS5")
+
+    req = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + target_port.to_bytes(2, "big")
+    sock.sendall(req)
+
+    head = sock.recv(4)
+    if len(head) != 4 or head[0] != 0x05 or head[1] != 0x00:
+        sock.close()
+        raise OSError("SOCKS5 connect failed")
+
+    atyp = head[3]
+    if atyp == 0x01:
+        to_read = 4 + 2
+    elif atyp == 0x03:
+        ln = sock.recv(1)
+        if len(ln) != 1:
+            sock.close()
+            raise OSError("Invalid SOCKS5 reply")
+        to_read = ln[0] + 2
+    elif atyp == 0x04:
+        to_read = 16 + 2
+    else:
+        sock.close()
+        raise OSError("Unsupported SOCKS5 reply address type")
+
+    remaining = to_read
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            sock.close()
+            raise OSError("Unexpected EOF from SOCKS5 proxy")
+        remaining -= len(chunk)
+
+    return sock
+
+
+def _http_get_json_via_socks(
+    request_url: str,
     token: str,
-    base_url: str,
-    endpoint: str,
+    timeout: int,
+    verify_tls: bool,
+    proxy_url: str,
+) -> object:
+    parsed = urlparse(request_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+
+    proxy = urlparse(proxy_url)
+    if proxy.scheme.lower() not in {"socks5", "socks5h"}:
+        raise ValueError(f"Unsupported SOCKS proxy scheme: {proxy.scheme}")
+    if not proxy.hostname or not proxy.port:
+        raise ValueError("Invalid SOCKS proxy URL")
+
+    target_host = parsed.hostname
+    if not target_host:
+        raise ValueError("Invalid request URL host")
+    target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    sock = _socks5_connect(proxy.hostname, proxy.port, target_host, target_port, timeout)
+    try:
+        if parsed.scheme == "https":
+            context = ssl.create_default_context()
+            if not verify_tls:
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+            sock = context.wrap_socket(sock, server_hostname=target_host)
+
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {target_host}\r\n"
+            f"Authorization: Token {token}\r\n"
+            "Accept: application/json\r\n"
+            "Accept-Encoding: identity\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        sock.sendall(request.encode("utf-8"))
+
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        payload = response.read()
+        if response.status >= 400:
+            raise OSError(f"HTTP {response.status}: {response.reason}")
+
+        return json.loads(payload.decode("utf-8"))
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _http_get_json_via_urllib(
+    request_url: str,
+    token: str,
     timeout: int,
     verify_tls: bool,
     proxy_url: Optional[str],
+) -> object:
+    handlers: List[urllib.request.BaseHandler] = []
+    if proxy_url:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+
+    opener = urllib.request.build_opener(*handlers)
+    req = urllib.request.Request(
+        request_url,
+        headers={
+            "Authorization": f"Token {token}",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+        },
+    )
+
+    context: Optional[ssl.SSLContext] = None
+    if request_url.lower().startswith("https://"):
+        context = ssl.create_default_context()
+        if not verify_tls:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+    open_kwargs = {"timeout": timeout}
+    if context is not None:
+        open_kwargs["context"] = context
+
+    with opener.open(req, **open_kwargs) as response:
+        payload = response.read()
+        return json.loads(payload.decode("utf-8"))
+
+
+def http_get_json(
+    request_url: str,
+    token: str,
+    timeout: int,
+    verify_tls: bool,
+    proxy_url: Optional[str],
+) -> object:
+    if proxy_url and proxy_url.lower().startswith("socks5"):
+        return _http_get_json_via_socks(request_url, token, timeout, verify_tls, proxy_url)
+    return _http_get_json_via_urllib(request_url, token, timeout, verify_tls, proxy_url)
+
+
+def paginated_get(
+    config: NetboxTopologyConfig,
+    endpoint: str,
     params: Optional[Dict[str, object]] = None,
 ) -> Iterable[Dict]:
-    url = urljoin(base_url.rstrip("/") + "/", endpoint.lstrip("/"))
+    url = urljoin(config.netbox_url.rstrip("/") + "/", endpoint.lstrip("/"))
     query = dict(params or {})
     if "limit" not in query:
         query["limit"] = 200
@@ -448,12 +472,13 @@ def paginated_get(
         if query:
             separator = "&" if "?" in request_url else "?"
             request_url = f"{request_url}{separator}{urlencode(query, doseq=True)}"
-        payload = curl_get_json(
+
+        payload = http_get_json(
             request_url=request_url,
-            token=token,
-            timeout=timeout,
-            verify_tls=verify_tls,
-            proxy_url=proxy_url,
+            token=config.netbox_token,
+            timeout=config.timeout,
+            verify_tls=config.verify_tls,
+            proxy_url=config.proxy_url,
         )
 
         if isinstance(payload, dict) and "results" in payload:
@@ -504,152 +529,50 @@ def peer_details(interface_payload: Dict) -> Tuple[Optional[int], Optional[str],
     return None, None, peer_if
 
 
-def curl_get_json(
-    request_url: str,
-    token: str,
-    timeout: int,
-    verify_tls: bool,
-    proxy_url: Optional[str],
-) -> object:
-    cmd = [
-        "curl",
-        "-sS",
-        "--max-time",
-        str(timeout),
-        "-H",
-        f"Authorization: Token {token}",
-        "-H",
-        "Accept: application/json",
-    ]
-    if proxy_url:
-        cmd.extend(["--proxy", proxy_url])
-    if not verify_tls:
-        cmd.append("--insecure")
-    cmd.append(request_url)
-
-    output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-    return json.loads(output.decode("utf-8"))
-
-
-def build_switch_map(
-    token: str,
-    base_url: str,
-    cluster: str,
-    cluster_id: int,
-    device_prefixes: List[str],
-    extra_contains: List[str],
-    timeout: int,
-    verify_tls: bool,
-    proxy_url: Optional[str],
-) -> Dict[int, str]:
+def build_switch_map(config: NetboxTopologyConfig, cluster_id: int) -> Dict[int, str]:
     switches: Dict[int, str] = {}
 
-    for device in paginated_get(
-        token,
-        base_url,
-        "/api/dcim/devices/",
-        timeout=timeout,
-        verify_tls=verify_tls,
-        proxy_url=proxy_url,
-        params={"cluster_id": cluster_id},
-    ):
+    for device in paginated_get(config, "/api/dcim/devices/", params={"cluster_id": cluster_id}):
         name = str(device.get("name") or "").strip()
         device_id = device.get("id")
         if not name or not isinstance(device_id, int):
             continue
-        lower_name = name.lower()
-        if not any(lower_name.startswith(prefix) for prefix in device_prefixes) and not any(
-            token in lower_name for token in extra_contains
-        ):
+        if not name.lower().startswith(config.device_prefix.lower()):
             continue
-        # Defensive check: enforce exact cluster-name match as requested.
-        if not in_cluster(device, cluster):
+        if not in_cluster(device, config.netbox_cluster):
             continue
         switches[device_id] = name
 
     return switches
 
 
-def resolve_cluster_id(
-    token: str,
-    base_url: str,
-    cluster_name: str,
-    timeout: int,
-    verify_tls: bool,
-    proxy_url: Optional[str],
-) -> int:
-    target = normalize_value(cluster_name)
+def resolve_cluster_id(config: NetboxTopologyConfig) -> int:
+    target = normalize_value(config.netbox_cluster)
     if not target:
         raise ValueError("Invalid cluster name")
 
-    # Try direct-name filter first.
-    for cluster in paginated_get(
-        token,
-        base_url,
-        "/api/virtualization/clusters/",
-        timeout=timeout,
-        verify_tls=verify_tls,
-        proxy_url=proxy_url,
-        params={"name": cluster_name},
-    ):
+    for cluster in paginated_get(config, "/api/virtualization/clusters/", params={"name": config.netbox_cluster}):
         cid = cluster.get("id")
         cname = normalize_value(cluster.get("name"))
         if isinstance(cid, int) and cname == target:
             return cid
 
-    # Fallback: scan all clusters if direct filter did not match exactly.
-    for cluster in paginated_get(
-        token,
-        base_url,
-        "/api/virtualization/clusters/",
-        timeout=timeout,
-        verify_tls=verify_tls,
-        proxy_url=proxy_url,
-    ):
+    for cluster in paginated_get(config, "/api/virtualization/clusters/"):
         cid = cluster.get("id")
         cname = normalize_value(cluster.get("name"))
         if isinstance(cid, int) and cname == target:
             return cid
 
-    raise ValueError(f"Cluster not found by name: {cluster_name}")
+    raise ValueError(f"Cluster not found by name: {config.netbox_cluster}")
 
 
 def build_edges(
-    token: str,
-    base_url: str,
+    config: NetboxTopologyConfig,
     switches: Dict[int, str],
-    device_prefixes: List[str],
-    extra_prefixes: List[str],
-    extra_contains: List[str],
-    primary_device_prefix: str,
-    port_prefix: str,
-    primary_extra_port_regexes: List[Pattern[str]],
-    extra_port_regexes: Dict[str, Pattern[str]],
-    timeout: int,
-    verify_tls: bool,
-    proxy_url: Optional[str],
     focus_devices: Optional[Set[str]] = None,
-    shared_devices: Optional[Set[str]] = None,
-    interface_overrides: Optional[Dict[str, str]] = None,
-    pcie_slot_map: Optional[Dict[str, Dict[str, str]]] = None,
-    exclude_regexes: Optional[List[Pattern[str]]] = None,
 ) -> Set[Edge]:
     edges: Set[Edge] = set()
     seen_cables: Set[int] = set()
-    valid_names = {name.lower() for name in switches.values()}
-    shared_names = shared_devices or set()
-    iface_overrides = interface_overrides or {}
-    pcie_map = pcie_slot_map or {}
-    excluded_ifaces = exclude_regexes or []
-    primary_device_prefix_l = primary_device_prefix.lower()
-    extra_prefixes_l = [prefix.lower() for prefix in extra_prefixes]
-    extra_contains_l = [token.lower() for token in extra_contains]
-
-    def allowed_device(name: str) -> bool:
-        lower = name.lower()
-        return any(lower.startswith(prefix) for prefix in device_prefixes) or any(
-            token in lower for token in extra_contains_l
-        )
 
     device_items = sorted(switches.items(), key=lambda pair: pair[1].lower())
     if focus_devices:
@@ -658,38 +581,18 @@ def build_edges(
             for device_id, device_name in device_items
             if device_name.lower() in focus_devices
         ]
-    else:
-        # Only parse primary devices by default; supported links always include primary side.
-        device_items = [
-            (device_id, device_name)
-            for device_id, device_name in device_items
-            if classify_device_kind(device_name, primary_device_prefix_l, extra_prefixes_l, extra_contains_l)
-            == "primary"
-        ]
 
     for device_id, device_name in device_items:
-        params = {"device_id": device_id}
-        for iface in paginated_get(
-            token,
-            base_url,
-            "/api/dcim/interfaces/",
-            timeout=timeout,
-            verify_tls=verify_tls,
-            proxy_url=proxy_url,
-            params=params,
-        ):
+        for iface in paginated_get(config, "/api/dcim/interfaces/", params={"device_id": device_id}):
             local_if = str(iface.get("name") or "").strip()
-            if is_excluded_interface(local_if, excluded_ifaces):
+            if is_excluded_interface(local_if, config.exclude_interface_regexes):
                 continue
             if not allowed_port_for_device(
                 device_name=device_name,
                 interface_name=local_if,
-                primary_prefix=primary_device_prefix_l,
-                primary_port_prefix=port_prefix,
-                primary_extra_port_regexes=primary_extra_port_regexes,
-                extra_prefixes=extra_prefixes_l,
-                extra_contains=extra_contains_l,
-                extra_port_regexes=extra_port_regexes,
+                primary_prefix=config.device_prefix,
+                primary_port_prefix=config.port_prefix,
+                primary_extra_port_regexes=config.primary_extra_port_regexes,
             ):
                 continue
 
@@ -706,53 +609,30 @@ def build_edges(
             if cable_id is not None and cable_id in seen_cables:
                 continue
 
-            peer_id, peer_device, peer_if = peer_details(iface)
+            _peer_id, peer_device, peer_if = peer_details(iface)
             if not peer_device or not peer_if:
                 continue
-            if is_excluded_interface(str(peer_if), excluded_ifaces):
+            peer_if_text = str(peer_if).strip()
+            if is_excluded_interface(peer_if_text, config.exclude_interface_regexes):
                 continue
-            if not allowed_device(peer_device):
-                continue
-            if not allowed_port_for_device(
-                device_name=peer_device,
-                interface_name=str(peer_if),
-                primary_prefix=primary_device_prefix_l,
-                primary_port_prefix=port_prefix,
-                primary_extra_port_regexes=primary_extra_port_regexes,
-                extra_prefixes=extra_prefixes_l,
-                extra_contains=extra_contains_l,
-                extra_port_regexes=extra_port_regexes,
-            ):
-                continue
-            local_kind = classify_device_kind(
-                device_name, primary_device_prefix_l, extra_prefixes_l, extra_contains_l
-            )
-            peer_kind = classify_device_kind(
-                peer_device, primary_device_prefix_l, extra_prefixes_l, extra_contains_l
-            )
-            if not is_supported_link(local_kind, peer_kind):
-                continue
-
-            if peer_id is not None:
-                if peer_id not in switches and peer_device.lower() not in shared_names:
-                    continue
-            elif peer_device.lower() not in valid_names and peer_device.lower() not in shared_names:
+            if not config.include_peer_regex.search(peer_device):
                 continue
 
             normalized_local_if = normalize_interface_for_output(
-                device_name, local_if, iface_overrides, pcie_map
+                device_name,
+                local_if,
+                config.interface_name_overrides,
+                config.pcie_slot_map,
             )
             normalized_peer_if = normalize_interface_for_output(
-                peer_device, str(peer_if), iface_overrides, pcie_map
+                peer_device,
+                peer_if_text,
+                config.interface_name_overrides,
+                config.pcie_slot_map,
             )
 
-            # Always render primary-side on the left so grouping is by switch.
-            if local_kind == "primary":
-                left = (device_name, normalized_local_if)
-                right = (peer_device, normalized_peer_if)
-            else:
-                left = (peer_device, normalized_peer_if)
-                right = (device_name, normalized_local_if)
+            left = (device_name, normalized_local_if)
+            right = (peer_device, normalized_peer_if)
             if left == right:
                 continue
             if focus_devices and left[0].lower() not in focus_devices and right[0].lower() not in focus_devices:
@@ -787,95 +667,46 @@ def render_dot(graph_name: str, edges: Set[Edge]) -> str:
 
 
 def main() -> int:
-    args = apply_pattern_config(parse_args())
-    verify_tls = not args.insecure
-    proxy_url = args.netbox_proxy
-    device_prefixes = parse_prefixes(args.device_prefix, args.extra_device_prefixes)
-    primary_prefix = args.device_prefix.strip().lower()
-    extra_prefixes = [prefix for prefix in device_prefixes if prefix != primary_prefix]
-    extra_contains = parse_name_list(args.extra_device_contains)
-    shared_devices = parse_name_set(args.shared_devices)
     try:
-        extra_port_regexes = parse_extra_regexes(
-            extra_prefixes=extra_prefixes,
-            raw_regexes=args.extra_port_regexes,
-            rtr_regex=args.rtr_port_regex,
-            nfw_regex=args.nfw_port_regex,
-        )
-        primary_extra_port_regexes = parse_regex_list(args.primary_extra_port_regexes)
-        interface_overrides = parse_interface_overrides(args.interface_name_overrides)
-        pcie_slot_map = parse_pcie_slot_map(args.pcie_slot_map)
-        exclude_regexes = parse_regex_list(args.exclude_interface_regexes)
-    except re.error as exc:
-        print(f"ERROR: Invalid port regex: {exc}", file=sys.stderr)
-        return 1
-    except ValueError as exc:
+        config = parse_config()
+    except (ValueError, re.error, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     try:
-        cluster_id = resolve_cluster_id(
-            token=args.netbox_token,
-            base_url=args.netbox_url,
-            cluster_name=args.netbox_cluster,
-            timeout=args.timeout,
-            verify_tls=verify_tls,
-            proxy_url=proxy_url,
-        )
-        switches = build_switch_map(
-            token=args.netbox_token,
-            base_url=args.netbox_url,
-            cluster=args.netbox_cluster,
-            cluster_id=cluster_id,
-            device_prefixes=device_prefixes,
-            extra_contains=extra_contains,
-            timeout=args.timeout,
-            verify_tls=verify_tls,
-            proxy_url=proxy_url,
-        )
+        cluster_id = resolve_cluster_id(config)
+        switches = build_switch_map(config, cluster_id)
         focus_devices: Optional[Set[str]] = None
-        if args.device_name:
-            focus_devices = {args.device_name.strip().lower()}
-            if args.device_name.strip().lower() not in {name.lower() for name in switches.values()}:
+        if config.device_name:
+            focus_devices = {config.device_name}
+            if config.device_name not in {name.lower() for name in switches.values()}:
                 raise ValueError(
-                    f"Device '{args.device_name}' not found in cluster '{args.netbox_cluster}' "
-                    f"with prefixes '{','.join(device_prefixes)}'."
+                    f"Device '{config.device_name}' not found in cluster '{config.netbox_cluster}' "
+                    f"with prefix '{config.device_prefix}'."
                 )
 
-        edges = build_edges(
-            token=args.netbox_token,
-            base_url=args.netbox_url,
-            switches=switches,
-            device_prefixes=device_prefixes,
-            extra_prefixes=extra_prefixes,
-            extra_contains=extra_contains,
-            primary_device_prefix=args.device_prefix,
-            port_prefix=args.port_prefix,
-            primary_extra_port_regexes=primary_extra_port_regexes,
-            extra_port_regexes=extra_port_regexes,
-            timeout=args.timeout,
-            verify_tls=verify_tls,
-            proxy_url=proxy_url,
-            focus_devices=focus_devices,
-            shared_devices=shared_devices,
-            interface_overrides=interface_overrides,
-            pcie_slot_map=pcie_slot_map,
-            exclude_regexes=exclude_regexes,
-        )
-    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+        edges = build_edges(config, switches, focus_devices)
+    except (
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+    ) as exc:
         print(f"ERROR: NetBox request failed: {exc}", file=sys.stderr)
         return 1
 
     dot = render_dot("NETBOX_TOPOLOGY", edges)
-    with open(args.output, "w", encoding="utf-8") as handle:
+    with open(config.output, "w", encoding="utf-8") as handle:
         handle.write(dot)
 
-    print(f"Generated {args.output}")
-    print(f"Matched devices in cluster '{args.netbox_cluster}': {len(switches)}")
+    print(f"Generated {config.output}")
+    print(f"Matched devices in cluster '{config.netbox_cluster}': {len(switches)}")
     print(
         "Cabled links "
-        f"({','.join(device_prefixes)}* + contains[{','.join(extra_contains)}]; "
-        f"{args.device_prefix} ports={args.port_prefix}*): {len(edges)}"
+        f"(cluster devices={config.device_prefix}*; "
+        f"peer filter={config.include_peer_regex.pattern}; "
+        f"{config.device_prefix} ports={config.port_prefix}*): {len(edges)}"
     )
     return 0
 
