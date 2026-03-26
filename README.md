@@ -390,6 +390,36 @@ In update mode, a full backup is created automatically at `~/lldpq-backup-YYYY-M
 
 Use `./install.sh --help` for all options. Use `./install.sh -y` for non-interactive mode (CI/scripts).
 
+## [05b] netbox topology builder (switch-centric)
+
+`lldpq/netbox_topology_builder.py` now builds topology from a strict switch-centric view:
+
+- cluster filter uses `virtualization.cluster.name` only (no site/tenant fallback)
+- only `swi*` devices inside the selected `--netbox-cluster` are scanned as the left side
+- only cabled switch interfaces are included (`swp*` plus allowed extras like `eth0`)
+- peer side is kept broad (all connected devices), with optional `--include-peer-regex`
+- interface exclusion regexes (for example `^XCC$,-RMC$`) apply on both cable ends
+- graph name is fixed to `NETBOX_TOPOLOGY`
+- JSON pattern file was removed; patterns are managed with CLI flags
+
+Default PCIe interface remapping now includes these device patterns:
+
+- `*-p-phy-osh*` (`1 -> 5`, `2 -> 8`)
+- `*-p-phy-cpo*` (`1 -> 5`, `2 -> 8`)
+- `*-proxmox-mgt*` (`1 -> 5`, `2 -> 8`)
+
+Example:
+
+```bash
+python3 lldpq/netbox_topology_builder.py \
+  --netbox-url "$NETBOX_URL" \
+  --netbox-token "$NETBOX_TOKEN" \
+  --netbox-cluster sys2-sta1 \
+  --netbox-proxy socks5://127.0.0.1:8888 \
+  --exclude-interface-regexes '^XCC$,-RMC$' \
+  --output topology.dot
+```
+
 ## [06] requirements
 
 - **Linux server** (Ubuntu 20.04+ recommended, tested on 22.04 and 24.04)
@@ -406,6 +436,67 @@ Monitor data grows ~50MB/day per fabric. Automatic cleanup keeps last 24 hours.
 ~/lldpq/lldp-results/        # ~10MB   LLDP topology data
 /var/www/html/configs/        # varies  device config backups (get-conf)
 /var/www/html/hstr/          # ~5MB    historical data
+```
+
+### INI history cleanup bash function
+
+Use this helper for **history snapshots** in `/var/www/html/hstr` (for example `Problems-YYYY-MM-DD--HH-MM.ini`).
+It keeps one snapshot per day for the last N days, plus very recent files:
+
+```bash
+cleanup_ini_history() {
+  local folder="${1:-/var/www/html/hstr}"
+  local keep_days="${2:-30}"
+  local keep_recent_days="${3:-1}"
+  local -a keep_files=()
+
+  cd "$folder" || return 1
+
+  for ((i=1; i<=keep_days; i++)); do
+    local start_date end_date file
+    start_date=$(date -d "$i days ago" '+%Y-%m-%d 00:00:00')
+    end_date=$(date -d "$((i - 1)) days ago" '+%Y-%m-%d 00:00:00')
+    file=$(find . -type f -name "*.ini" -newermt "$start_date" ! -newermt "$end_date" | sort | head -n 1)
+    [[ -n "$file" ]] && keep_files+=("$file")
+  done
+
+  while IFS= read -r file; do
+    keep_files+=("$file")
+  done < <(find . -type f -name "*.ini" -mtime "-$keep_recent_days")
+
+  find . -type f -name "*.ini" | while IFS= read -r file; do
+    if ! printf '%s\n' "${keep_files[@]}" | grep -Fqx -- "$file"; then
+      sudo rm -f "$file"
+    fi
+  done
+}
+```
+
+Usage:
+
+```bash
+# default: /var/www/html/hstr, keep 30 days + last 1 day
+cleanup_ini_history
+
+# custom folder and retention
+cleanup_ini_history /var/www/html/hstr 45 2
+```
+
+### per-device LLDP `.ini` behavior
+
+`lldpq/check-lldp.sh` writes one temporary file per device in `lldp-results/` using
+`<device>_lldp_result.ini`, then `lldp-validate.py` combines them into `lldp_results.ini`
+and removes the per-device files in the same run.
+
+So these per-device files are **in-place/ephemeral**, not daily history files.
+If you ever need manual stale cleanup (for an interrupted run), use:
+
+```bash
+cleanup_stale_lldp_device_ini() {
+  local folder="${1:-$HOME/lldpq/lldp-results}"
+  local older_than_minutes="${2:-120}"
+  find "$folder" -type f -name "*_lldp_result.ini" -mmin "+$older_than_minutes" -delete
+}
 ```
 
 ## [08] ssh setup
