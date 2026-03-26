@@ -321,6 +321,73 @@ class NetboxTopologyBuilderTests(unittest.TestCase):
         self.assertTrue(mock_socks.called)
         self.assertTrue(mock_url.called)
 
+    def test_http_get_json_via_urllib_https_uses_handler_not_open_context(self):
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok":1}'
+
+        class DummyOpener:
+            def __init__(self):
+                self.kwargs = {}
+
+            def open(self, *args, **kwargs):
+                self.kwargs = kwargs
+                return DummyResponse()
+
+        opener = DummyOpener()
+        fake_context = object()
+        fake_handler = object()
+
+        with patch.object(NTB.ssl, "create_default_context", return_value=fake_context), patch.object(
+            NTB.urllib.request, "HTTPSHandler", return_value=fake_handler
+        ) as mock_https_handler, patch.object(
+            NTB.urllib.request, "build_opener", return_value=opener
+        ) as mock_build_opener:
+            result = NTB._http_get_json_via_urllib("https://example.test/api", "tok", 12, True, None)
+
+        self.assertEqual(result, {"ok": 1})
+        mock_https_handler.assert_called_once_with(context=fake_context)
+        mock_build_opener.assert_called_once_with(fake_handler)
+        self.assertEqual(opener.kwargs, {"timeout": 12})
+        self.assertNotIn("context", opener.kwargs)
+
+    def test_http_get_json_via_urllib_https_insecure_adjusts_context(self):
+        class DummyContext:
+            def __init__(self):
+                self.check_hostname = True
+                self.verify_mode = NTB.ssl.CERT_REQUIRED
+
+        class DummyResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"ok":1}'
+
+        class DummyOpener:
+            def open(self, *args, **kwargs):
+                return DummyResponse()
+
+        ctx = DummyContext()
+
+        with patch.object(NTB.ssl, "create_default_context", return_value=ctx), patch.object(
+            NTB.urllib.request, "HTTPSHandler", return_value=object()
+        ), patch.object(NTB.urllib.request, "build_opener", return_value=DummyOpener()):
+            result = NTB._http_get_json_via_urllib("https://example.test/api", "tok", 12, False, None)
+
+        self.assertEqual(result, {"ok": 1})
+        self.assertFalse(ctx.check_hostname)
+        self.assertEqual(ctx.verify_mode, NTB.ssl.CERT_NONE)
+
 
 if __name__ == "__main__":
     unittest.main()

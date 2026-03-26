@@ -378,6 +378,13 @@ def _http_get_json_via_socks(
     try:
         if parsed.scheme == "https":
             context = ssl.create_default_context()
+            if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+            else:
+                if hasattr(ssl, "OP_NO_TLSv1"):
+                    context.options |= ssl.OP_NO_TLSv1
+                if hasattr(ssl, "OP_NO_TLSv1_1"):
+                    context.options |= ssl.OP_NO_TLSv1_1
             if not verify_tls:
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
@@ -419,6 +426,13 @@ def _http_get_json_via_urllib(
     if proxy_url:
         handlers.append(urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
 
+    if request_url.lower().startswith("https://"):
+        context = ssl.create_default_context()
+        if not verify_tls:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+
     opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(
         request_url,
@@ -429,18 +443,7 @@ def _http_get_json_via_urllib(
         },
     )
 
-    context: Optional[ssl.SSLContext] = None
-    if request_url.lower().startswith("https://"):
-        context = ssl.create_default_context()
-        if not verify_tls:
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-
-    open_kwargs = {"timeout": timeout}
-    if context is not None:
-        open_kwargs["context"] = context
-
-    with opener.open(req, **open_kwargs) as response:
+    with opener.open(req, timeout=timeout) as response:
         payload = response.read()
         return json.loads(payload.decode("utf-8"))
 
