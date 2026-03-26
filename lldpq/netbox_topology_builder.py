@@ -428,6 +428,13 @@ def _http_get_json_via_urllib(
 
     if request_url.lower().startswith("https://"):
         context = ssl.create_default_context()
+        if hasattr(ssl, "TLSVersion") and hasattr(ssl.TLSVersion, "TLSv1_2"):
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+        else:
+            if hasattr(ssl, "OP_NO_TLSv1"):
+                context.options |= ssl.OP_NO_TLSv1
+            if hasattr(ssl, "OP_NO_TLSv1_1"):
+                context.options |= ssl.OP_NO_TLSv1_1
         if not verify_tls:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
