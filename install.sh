@@ -815,6 +815,7 @@ echo "BASE_CONFIG_DIR=$LLDPQ_INSTALL_DIR/sw-base" | sudo tee -a /etc/lldpq.conf 
 echo "AUTO_BASE_CONFIG=true" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "AUTO_ZTP_DISABLE=true" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "AUTO_SET_HOSTNAME=true" | sudo tee -a /etc/lldpq.conf > /dev/null
+echo "LLDP_RESULT_HISTORY_LIMIT=" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "AI_PROVIDER=ollama" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "AI_MODEL=llama3.2" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "AI_API_KEY=" | sudo tee -a /etc/lldpq.conf > /dev/null

@@ -1,6 +1,6 @@
 # LLDPq - Network Monitoring for Cumulus Linux Switches
 # Single container: nginx + fcgiwrap + python3 + ssh + cron
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 LABEL maintainer="ali@lldpq.dev"
 LABEL description="LLDPq Network Monitoring"
@@ -9,6 +9,9 @@ LABEL version="3.5.5"
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
+
+# Copy Python project metadata early so dependency-related layers can track it.
+COPY pyproject.toml uv.lock /tmp/lldpq-python/
 
 # Install all dependencies in one layer
 # bsdmainutils + bsdextrautils: 'column' command (moved in Ubuntu 22.04)
@@ -92,6 +95,7 @@ RUN MONACO_VERSION="0.45.0" && TMP_DIR=$(mktemp -d) && \
 
 # Copy lldpq scripts
 COPY lldpq/ /home/lldpq/lldpq/
+COPY pyproject.toml uv.lock /home/lldpq/lldpq/
 COPY bin/ /usr/local/bin/
 
 # Copy nginx config

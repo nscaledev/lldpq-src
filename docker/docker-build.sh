@@ -5,7 +5,7 @@
 # Usage: ./docker/docker-build.sh
 # Run from repo root directory, on any machine with Docker installed
 #
-# Output: ~/lldpq.tar.gz
+# Output: ./lldpq-<arch>.tar.gz
 
 set -e
 
@@ -18,6 +18,7 @@ NC='\033[0m'
 
 IMAGE_NAME="lldpq"
 IMAGE_TAG="latest"
+DOCKER_CMD="docker"
 
 # Detect architecture: amd64 or arm64
 ARCH=$(uname -m)
@@ -26,7 +27,7 @@ case "$ARCH" in
     aarch64) ARCH_LABEL="arm64" ;;
     *)       ARCH_LABEL="$ARCH" ;;
 esac
-OUTPUT_FILE="$HOME/lldpq-${ARCH_LABEL}.tar.gz"
+OUTPUT_FILE="$PWD/lldpq-${ARCH_LABEL}.tar.gz"
 
 # Find repo root (script is in docker/ subfolder)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -44,25 +45,39 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
+# Prefer plain docker. Fall back to sudo only if the daemon is not accessible.
+if ! docker info >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
+        DOCKER_CMD="sudo docker"
+    else
+        echo -e "${RED}Error: Docker is installed but not accessible to the current user${NC}"
+        echo -e "Try one of:"
+        echo -e "  ${YELLOW}- start Docker Desktop / daemon${NC}"
+        echo -e "  ${YELLOW}- run once with sudo privileges${NC}"
+        echo -e "  ${YELLOW}- add your user to the docker group (Linux)${NC}"
+        exit 1
+    fi
+fi
+
 echo -e "${YELLOW}[1/4]${NC} Building Docker image..."
 cd "$REPO_ROOT"
-sudo docker build -f docker/Dockerfile --build-arg TARGETARCH=${ARCH_LABEL} -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:${VERSION} . 2>&1 | tail -5
+$DOCKER_CMD build -f docker/Dockerfile --build-arg TARGETARCH=${ARCH_LABEL} -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:${VERSION} . 2>&1 | tail -5
 echo -e "${GREEN}  ✓ Built${NC}"
 echo ""
 
 echo -e "${YELLOW}[2/4]${NC} Image info:"
-sudo docker images ${IMAGE_NAME} --format '  {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}'
+$DOCKER_CMD images ${IMAGE_NAME} --format '  {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedAt}}'
 echo ""
 
 echo -e "${YELLOW}[3/4]${NC} Exporting to ${OUTPUT_FILE}..."
-sudo docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > "${OUTPUT_FILE}"
+$DOCKER_CMD save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > "${OUTPUT_FILE}"
 chmod 644 "${OUTPUT_FILE}"
 SIZE=$(ls -lh "${OUTPUT_FILE}" | awk '{print $5}')
 echo -e "${GREEN}  ✓ Exported (${SIZE})${NC}"
 echo ""
 
 echo -e "${YELLOW}[4/4]${NC} Cleaning up old test containers..."
-sudo docker rm -f lldpq-test 2>/dev/null || true
+$DOCKER_CMD rm -f lldpq-test 2>/dev/null || true
 echo -e "${GREEN}  ✓ Clean${NC}"
 echo ""
 
