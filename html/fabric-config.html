@@ -1339,6 +1339,13 @@
             }
         }
         
+        function resolveJinja(value, config) {
+            if (typeof value !== 'string' || !value.includes('{{')) return value;
+            return value.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, varName) => {
+                return config[varName] !== undefined ? config[varName] : _;
+            });
+        }
+        
         // Get BGP ASN from config (try top-level first, then from VRFs)
         function getBgpAsn(config) {
             // Check top-level bgp_asn
@@ -1541,11 +1548,12 @@
                         <table class="data-table" style="table-layout: fixed;">
                             <thead>
                                 <tr>
-                                    <th style="width: 20%;">VRF Name</th>
-                                    <th style="width: 22%;">VXLAN Interface</th>
-                                    <th style="width: 18%;">L3VNI</th>
-                                    <th style="width: 30%;">BGP Profile</th>
-                                    <th style="width: 10%; text-align: right;">ASN</th>
+                                    <th style="width: 18%;">VRF Name</th>
+                                    <th style="width: 18%;">VXLAN Interface</th>
+                                    <th style="width: 12%;">L3VNI</th>
+                                    <th style="width: 26%;">BGP Profile</th>
+                                    <th style="width: 14%;">Loopback IP</th>
+                                    <th style="width: 12%; text-align: right;">ASN</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -1574,6 +1582,10 @@
                     // Don't show X for default VRF
                     const showRemove = vrfName !== 'default';
                     
+                    // Resolve loopback IP: VRF lo field → fallback to top-level lo_ip
+                    let loopbackVal = vrfConfig.lo ? resolveJinja(vrfConfig.lo, config) : (config.lo_ip || '');
+                    const loopbackDisplay = loopbackVal ? String(loopbackVal).split('/')[0] : '-';
+                    
                     html += `
                         <tr>
                             <td>
@@ -1585,7 +1597,8 @@
                             <td>${vxlanInt !== '-' ? `<span class="badge badge-gray">${vxlanInt}</span>` : '-'}</td>
                             <td>${vrfConfig.l3vni || '-'}</td>
                             <td>${vrfConfig.bgp?.bgp_profile || '-'}</td>
-                            <td style="text-align: right;">${vrfConfig.bgp?.asn || '-'}</td>
+                            <td>${loopbackDisplay}</td>
+                            <td style="text-align: right;">${resolveJinja(vrfConfig.bgp?.asn, config) || '-'}</td>
                         </tr>
                     `;
                 }
@@ -4551,7 +4564,7 @@
                     const modeA = portProfiles[a].sw_port_mode || 'access';
                     const modeB = portProfiles[b].sw_port_mode || 'access';
                     if (modeA !== modeB) return modeA === 'access' ? -1 : 1;
-                    return a.localeCompare(b);
+                    return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
                 });
                 
                 for (const profileName of sortedProfiles) {
